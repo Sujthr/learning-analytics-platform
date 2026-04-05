@@ -1,0 +1,88 @@
+# Learning Analytics Platform - Pipeline Configuration
+
+ingestion:
+  supported_formats: [csv, xlsx]
+  chunk_size: 50000
+  encoding: utf-8
+  sources:
+    coursera:
+      schema:
+        required_columns: [student_id, course_id, timestamp, activity_type]
+        optional_columns: [duration_minutes, video_id, score, completion_pct]
+    lms:
+      schema:
+        required_columns: [student_id, course_id, session_start, session_end]
+        optional_columns: [page_views, downloads, forum_posts]
+    academic:
+      schema:
+        required_columns: [student_id, course_id, grade, semester]
+        optional_columns: [credits, gpa, enrollment_status]
+
+cleaning:
+  missing_values:
+    numeric_strategy: median  # mean, median, drop, zero
+    categorical_strategy: mode  # mode, drop, unknown
+    threshold: 0.5  # drop column if >50% missing
+  duplicates:
+    subset: null  # columns to check; null = all
+    keep: first  # first, last, false
+  timestamp:
+    target_format: "%Y-%m-%d %H:%M:%S"
+    timezone: UTC
+
+integration:
+  mapping_table: data/sample/student_mapping.csv
+  join_key: student_id
+  conflict_resolution: latest  # latest, source_priority, manual
+  source_priority: [academic, lms, coursera]
+
+features:
+  engagement_score:
+    weights:
+      session_frequency: 0.3
+      video_completion: 0.25
+      assessment_score: 0.25
+      forum_activity: 0.2
+  session_frequency:
+    window_days: 30
+  video_completion:
+    threshold: 0.8  # considered "complete" if >= 80%
+  assessment_improvement:
+    method: slope  # slope, pct_change
+  custom_features: []
+
+analytics:
+  eda:
+    correlation_method: pearson  # pearson, spearman, kendall
+    distribution_bins: 30
+  hypothesis_testing:
+    significance_level: 0.05
+    tests: [t_test, anova]
+  ml:
+    regression:
+      target: final_score
+      model: random_forest  # linear, ridge, lasso, random_forest, gradient_boosting
+      test_size: 0.2
+      cv_folds: 5
+    classification:
+      target: dropout
+      model: random_forest  # logistic, random_forest, gradient_boosting, svm
+      test_size: 0.2
+      cv_folds: 5
+    clustering:
+      method: kmeans  # kmeans, dbscan, hierarchical
+      n_clusters: 4
+      features: [engagement_score, session_frequency, video_completion_pct, avg_assessment_score]
+
+visualization:
+  theme: plotly_white
+  color_palette: ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd"]
+  dashboard:
+    port: 8050
+    debug: false
+
+reporting:
+  output_dir: output/reports
+  formats: [pdf, csv]
+  include_plots: true
+  decimal_places: 3
