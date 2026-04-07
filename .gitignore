@@ -22,7 +22,8 @@ output/
 .DS_Store
 Thumbs.db
 
-# Data (sample data is committed, but large datasets should not be)
-data/*.csv
-data/*.xlsx
-!data/sample/
+# Data — NEVER commit CSV/Excel data files (privacy)
+data/**/*.csv
+data/**/*.xlsx
+data/**/*.xls
+*.db
