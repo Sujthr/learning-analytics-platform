@@ -1,8 +1,11 @@
 """Skill Intelligence Engine — taxonomy, mapping, scoring, gap analysis."""
 
+import logging
 import pandas as pd
 import numpy as np
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 # Skill taxonomy: category -> skills
@@ -17,7 +20,7 @@ SKILL_TAXONOMY = {
     "Data Analytics": ["Data Analytics", "Spreadsheets", "Tableau"],
 }
 
-# Course -> skills mapping
+# Course ID -> skills mapping (for generated sample data)
 COURSE_SKILL_MAP = {
     "CRS-001": ["Machine Learning", "Python", "Statistics"],
     "CRS-002": ["Deep Learning", "Neural Networks", "TensorFlow"],
@@ -36,9 +39,94 @@ COURSE_SKILL_MAP = {
     "CRS-015": ["Excel", "Data Analysis", "Business Intelligence"],
 }
 
+# Keyword -> skills mapping (for auto-detecting skills from course names)
+KEYWORD_SKILL_MAP = {
+    "python": ["Python", "Programming Fundamentals"],
+    "java": ["Java", "Programming Fundamentals"],
+    "javascript": ["JavaScript", "Programming Fundamentals"],
+    "c++": ["C++", "Programming Fundamentals"],
+    "machine learning": ["Machine Learning", "Statistics", "Python"],
+    "deep learning": ["Deep Learning", "Neural Networks"],
+    "artificial intelligence": ["Machine Learning", "Deep Learning"],
+    "ai ": ["Machine Learning", "Deep Learning"],
+    "neural network": ["Neural Networks", "Deep Learning"],
+    "nlp": ["NLP", "Deep Learning"],
+    "natural language": ["NLP", "Deep Learning"],
+    "data science": ["Data Science", "Statistics", "Python"],
+    "data analysis": ["Data Analysis", "Statistics"],
+    "data analytics": ["Data Analytics", "Data Analysis"],
+    "statistics": ["Statistics", "Data Analysis"],
+    "sql": ["SQL", "Databases"],
+    "database": ["SQL", "Databases"],
+    "excel": ["Excel", "Data Analysis"],
+    "tableau": ["Tableau", "Data Visualization"],
+    "power bi": ["Power BI", "Data Visualization"],
+    "visualization": ["Data Visualization"],
+    "r programming": ["R Programming", "Statistics"],
+    "tensorflow": ["TensorFlow", "Deep Learning"],
+    "pytorch": ["Deep Learning", "Python"],
+    "cloud": ["Cloud Computing", "Infrastructure"],
+    "aws": ["AWS", "Cloud Computing"],
+    "azure": ["Cloud Computing", "Infrastructure"],
+    "gcp": ["Cloud Computing", "Infrastructure"],
+    "devops": ["DevOps", "Cloud Computing"],
+    "docker": ["DevOps", "Infrastructure"],
+    "kubernetes": ["DevOps", "Cloud Computing"],
+    "cybersecurity": ["Cybersecurity", "Network Security"],
+    "security": ["Cybersecurity", "Risk Assessment"],
+    "blockchain": ["Blockchain", "Programming Fundamentals"],
+    "web development": ["Web Development", "Programming Fundamentals"],
+    "react": ["Web Development", "JavaScript"],
+    "html": ["Web Development", "Programming Fundamentals"],
+    "css": ["Web Development", "Programming Fundamentals"],
+    "project management": ["Project Management", "Leadership"],
+    "agile": ["Agile", "Project Management"],
+    "scrum": ["Agile", "Project Management"],
+    "leadership": ["Leadership", "Management"],
+    "management": ["Management", "Leadership"],
+    "business": ["Business Analysis", "Strategy"],
+    "strategy": ["Strategy", "Business Analysis"],
+    "marketing": ["Digital Marketing", "Analytics"],
+    "seo": ["SEO", "Digital Marketing"],
+    "ux": ["UX Design", "User Research"],
+    "ui": ["UX Design", "Prototyping"],
+    "design": ["UX Design", "Prototyping"],
+    "finance": ["Finance", "Business Analysis"],
+    "accounting": ["Finance", "Business Analysis"],
+    "economics": ["Economics", "Finance"],
+    "communication": ["Communication", "Leadership"],
+    "negotiation": ["Negotiation", "Leadership"],
+    "differential equation": ["Mathematics", "Engineering"],
+    "calculus": ["Mathematics", "Engineering"],
+    "linear algebra": ["Mathematics", "Data Science"],
+    "probability": ["Statistics", "Mathematics"],
+    "engineering": ["Engineering"],
+    "biotechnology": ["Biotechnology", "Science"],
+    "biology": ["Biology", "Science"],
+    "chemistry": ["Chemistry", "Science"],
+    "physics": ["Physics", "Science"],
+    "prompt engineering": ["Prompt Engineering", "Machine Learning"],
+    "generative ai": ["Machine Learning", "Deep Learning"],
+    "chatgpt": ["Machine Learning", "Prompt Engineering"],
+    "automation": ["Automation", "Programming Fundamentals"],
+    "robotics": ["Robotics", "Engineering"],
+    "iot": ["IoT", "Engineering"],
+    "networking": ["Network Security", "Infrastructure"],
+    "ethical hacking": ["Cybersecurity", "Network Security"],
+}
+
+
+EXTENDED_TAXONOMY = {
+    **SKILL_TAXONOMY,
+    "Mathematics & Science": ["Mathematics", "Engineering", "Science", "Physics", "Chemistry", "Biology", "Biotechnology", "Economics"],
+    "Emerging Tech": ["Blockchain", "IoT", "Robotics", "Automation", "Prompt Engineering"],
+    "Web & Software": ["Web Development", "JavaScript", "Java", "C++"],
+    "Management": ["Management", "Communication", "Negotiation"],
+}
+
 
 def _get_skill_category(skill: str) -> str:
-    for cat, skills in SKILL_TAXONOMY.items():
+    for cat, skills in EXTENDED_TAXONOMY.items():
         if skill in skills:
             return cat
     return "Other"
@@ -53,7 +141,41 @@ class SkillIntelligenceEngine:
         course_skill_map: dict | None = None,
     ):
         self.activity = course_activity_df.copy()
-        self.skill_map = course_skill_map or COURSE_SKILL_MAP
+
+        if course_skill_map:
+            self.skill_map = course_skill_map
+        else:
+            # Check if course IDs match the static map
+            course_ids = set(self.activity["course_id"].unique()) if "course_id" in self.activity.columns else set()
+            static_ids = set(COURSE_SKILL_MAP.keys())
+            if course_ids & static_ids:
+                self.skill_map = COURSE_SKILL_MAP
+            else:
+                # Auto-build skill map from course names using keyword matching
+                self.skill_map = self._auto_map_skills()
+
+    def _auto_map_skills(self) -> dict:
+        """Auto-generate course->skills mapping from course names using keywords."""
+        id_col = "course_id" if "course_id" in self.activity.columns else "course_name"
+        name_col = "course_name" if "course_name" in self.activity.columns else id_col
+
+        course_ids = self.activity[[id_col, name_col]].drop_duplicates()
+        skill_map = {}
+
+        for _, row in course_ids.iterrows():
+            cid = row[id_col]
+            cname = str(row[name_col]).lower()
+            skills = set()
+            for keyword, mapped_skills in KEYWORD_SKILL_MAP.items():
+                if keyword in cname:
+                    skills.update(mapped_skills)
+            if not skills:
+                # Default: tag with a generic "General" skill
+                skills = {"General Knowledge"}
+            skill_map[cid] = list(skills)
+
+        logger.info(f"Auto-mapped {len(skill_map)} courses to skills from names")
+        return skill_map
 
     def compute_skill_scores(self) -> pd.DataFrame:
         """Compute skill score per learner based on course completion/progress.
