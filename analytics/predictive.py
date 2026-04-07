@@ -1,4 +1,16 @@
-"""Predictive Analytics — dropout, completion, high performer identification."""
+"""Predictive Analytics — dropout, completion, high performer identification.
+
+Key design principle: features must be BEHAVIORAL SIGNALS that are available
+before the outcome is known. We never use progress, completion count, or
+grades as features because those ARE the outcome.
+
+Behavioral signals used:
+  - Learning hours (effort invested)
+  - Video watch patterns (engagement depth)
+  - Recency of activity (momentum)
+  - Number of courses enrolled (ambition/load)
+  - Engagement score components (hours, video, recency — NOT progress)
+"""
 
 import logging
 from typing import Optional
@@ -11,10 +23,17 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score,
-    roc_auc_score, confusion_matrix, classification_report,
+    roc_auc_score, confusion_matrix,
 )
 
 logger = logging.getLogger(__name__)
+
+# Features that directly encode the outcome — NEVER use these for prediction
+OUTCOME_FEATURES = {
+    "avg_progress", "max_progress", "courses_completed",
+    "completion_rate", "avg_grade", "engagement_score",
+    "progress_component",
+}
 
 
 class PredictiveAnalytics:
@@ -38,46 +57,97 @@ class PredictiveAnalytics:
         engagement_scores: pd.DataFrame | None = None,
         video_activity: pd.DataFrame | None = None,
     ) -> pd.DataFrame:
-        """Build a learner-level feature matrix for ML models."""
-        agg_dict = {
-            "courses_enrolled": ("course_id", "count"),
+        """Build a learner-level feature matrix.
+
+        Separates BEHAVIORAL features (used for prediction) from
+        OUTCOME features (used only as labels).
+        """
+        # ── Outcome columns (labels only, not model inputs) ─────────
+        outcome_agg = {
             "avg_progress": ("progress_pct", "mean"),
             "max_progress": ("progress_pct", "max"),
             "courses_completed": ("is_completed", "sum"),
         }
-        if "learning_hours" in course_activity.columns:
-            agg_dict["total_hours"] = ("learning_hours", "sum")
-            agg_dict["avg_hours_per_course"] = ("learning_hours", "mean")
-        if "grade" in course_activity.columns:
-            agg_dict["avg_grade"] = ("grade", "mean")
-
-        features = course_activity.groupby("email").agg(**agg_dict).reset_index()
-
-        features["completion_rate"] = (
-            features["courses_completed"] / features["courses_enrolled"]
+        outcomes = course_activity.groupby("email").agg(**outcome_agg).reset_index()
+        outcomes["completion_rate"] = (
+            outcomes["courses_completed"] / course_activity.groupby("email")["course_id"].count().values
         ).fillna(0)
 
-        # Add engagement scores
-        if engagement_scores is not None and not engagement_scores.empty:
-            features = features.merge(
-                engagement_scores[["email", "score", "progress_component",
-                                   "hours_component", "video_component",
-                                   "recency_component"]],
-                on="email", how="left",
-            )
-            features = features.rename(columns={"score": "engagement_score"})
+        # ── Behavioral features (safe for prediction) ───────────────
+        behavioral_agg = {
+            "courses_enrolled": ("course_id", "count"),
+        }
+        if "learning_hours" in course_activity.columns:
+            behavioral_agg["total_hours"] = ("learning_hours", "sum")
+            behavioral_agg["avg_hours_per_course"] = ("learning_hours", "mean")
+            behavioral_agg["std_hours"] = ("learning_hours", "std")
 
-        # Add video features
+        features = course_activity.groupby("email").agg(**behavioral_agg).reset_index()
+
+        # Time-based features
+        if "enrollment_ts" in course_activity.columns and "last_activity_ts" in course_activity.columns:
+            time_feats = course_activity.copy()
+            time_feats["enrollment_ts"] = pd.to_datetime(time_feats["enrollment_ts"], errors="coerce")
+            time_feats["last_activity_ts"] = pd.to_datetime(time_feats["last_activity_ts"], errors="coerce")
+
+            time_agg = time_feats.groupby("email").agg(
+                first_enrollment=("enrollment_ts", "min"),
+                last_activity=("last_activity_ts", "max"),
+                enrollment_span_days=("enrollment_ts", lambda x: (x.max() - x.min()).days),
+            ).reset_index()
+
+            ref_date = pd.Timestamp.now()
+            time_agg["days_since_last_activity"] = (ref_date - time_agg["last_activity"]).dt.days.clip(lower=0)
+            time_agg["account_age_days"] = (ref_date - time_agg["first_enrollment"]).dt.days.clip(lower=0)
+
+            # Learning velocity: hours per active week
+            if "total_hours" in features.columns:
+                features = features.merge(time_agg[["email", "days_since_last_activity",
+                                                     "account_age_days", "enrollment_span_days"]], on="email", how="left")
+                features["hours_per_week"] = (
+                    features["total_hours"] / (features["account_age_days"] / 7).clip(lower=1)
+                ).round(3)
+            else:
+                features = features.merge(time_agg[["email", "days_since_last_activity",
+                                                     "account_age_days", "enrollment_span_days"]], on="email", how="left")
+
+        # Engagement score COMPONENTS (excluding progress_component which leaks)
+        if engagement_scores is not None and not engagement_scores.empty:
+            safe_eng_cols = ["email"]
+            for col in ["hours_component", "video_component", "recency_component"]:
+                if col in engagement_scores.columns:
+                    safe_eng_cols.append(col)
+            if len(safe_eng_cols) > 1:
+                features = features.merge(engagement_scores[safe_eng_cols], on="email", how="left")
+
+        # Video behavioral features
         if video_activity is not None and not video_activity.empty:
             vid_feats = video_activity.groupby("email").agg(
                 videos_watched=("video_id", "count"),
+                unique_videos=("video_id", "nunique"),
                 avg_video_completion=("completion_pct", "mean"),
+                total_watch_seconds=("watch_seconds", "sum"),
                 total_rewatches=("watch_count", "sum"),
+                avg_rewatch_rate=("watch_count", "mean"),
             ).reset_index()
+            vid_feats["rewatch_ratio"] = (
+                vid_feats["total_rewatches"] / vid_feats["videos_watched"]
+            ).fillna(0).round(3)
             features = features.merge(vid_feats, on="email", how="left")
 
         features = features.fillna(0)
+
+        # Merge outcome columns for label creation (kept separate)
+        features = features.merge(outcomes, on="email", how="left")
+
         return features
+
+    def _get_safe_feature_cols(self, df: pd.DataFrame, extra_exclude: set | None = None) -> list[str]:
+        """Return feature columns excluding email, outcomes, and any extra columns."""
+        exclude = {"email"} | OUTCOME_FEATURES
+        if extra_exclude:
+            exclude |= extra_exclude
+        return [c for c in df.columns if c not in exclude]
 
     def predict_dropout(
         self,
@@ -87,12 +157,15 @@ class PredictiveAnalytics:
     ) -> dict:
         """Predict which learners are likely to drop out.
 
-        Dropout = avg_progress < threshold and no completions.
+        Dropout definition: avg_progress < threshold AND zero completions.
+        Features used: behavioral signals ONLY (hours, video, recency, enrollment count).
         """
         df = features_df.copy()
-        df["is_dropout"] = ((df["avg_progress"] < dropout_threshold) & (df["courses_completed"] == 0)).astype(int)
+        df["is_dropout"] = (
+            (df["avg_progress"] < dropout_threshold) & (df["courses_completed"] == 0)
+        ).astype(int)
 
-        feature_cols = [c for c in df.columns if c not in ["email", "is_dropout"]]
+        feature_cols = self._get_safe_feature_cols(df, {"is_dropout"})
         return self._train_classifier(df, feature_cols, "is_dropout", model_type, "dropout")
 
     def predict_completion(
@@ -100,11 +173,14 @@ class PredictiveAnalytics:
         features_df: pd.DataFrame,
         model_type: str = "random_forest",
     ) -> dict:
-        """Predict completion likelihood (will the learner complete at least one course?)."""
+        """Predict whether a learner will complete at least one course.
+
+        Features used: behavioral signals ONLY.
+        """
         df = features_df.copy()
         df["will_complete"] = (df["courses_completed"] > 0).astype(int)
 
-        feature_cols = [c for c in df.columns if c not in ["email", "will_complete", "courses_completed", "completion_rate"]]
+        feature_cols = self._get_safe_feature_cols(df, {"will_complete"})
         return self._train_classifier(df, feature_cols, "will_complete", model_type, "completion")
 
     def identify_high_performers(
@@ -113,12 +189,16 @@ class PredictiveAnalytics:
         model_type: str = "random_forest",
         percentile: float = 75.0,
     ) -> dict:
-        """Identify learners likely to be high performers."""
+        """Identify learners likely to be high performers.
+
+        High performer = top percentile by avg_progress.
+        Features used: behavioral signals ONLY.
+        """
         df = features_df.copy()
         threshold = df["avg_progress"].quantile(percentile / 100)
         df["is_high_performer"] = (df["avg_progress"] >= threshold).astype(int)
 
-        feature_cols = [c for c in df.columns if c not in ["email", "is_high_performer"]]
+        feature_cols = self._get_safe_feature_cols(df, {"is_high_performer"})
         return self._train_classifier(df, feature_cols, "is_high_performer", model_type, "high_performer")
 
     def _train_classifier(
@@ -135,6 +215,10 @@ class PredictiveAnalytics:
         if len(np.unique(y)) < 2:
             return {"error": f"Only one class present for {task_name}. Cannot train."}
 
+        # Log feature list for transparency
+        logger.info(f"[{task_name}] Training with {len(feature_cols)} features: {feature_cols}")
+        logger.info(f"[{task_name}] Class distribution: {dict(zip(*np.unique(y, return_counts=True)))}")
+
         scaler = StandardScaler()
         X_scaled = scaler.fit_transform(X)
 
@@ -150,7 +234,8 @@ class PredictiveAnalytics:
         y_proba = model.predict_proba(X_test)[:, 1] if hasattr(model, "predict_proba") else None
 
         # Cross-validation
-        cv_scores = cross_val_score(model, X_scaled, y, cv=min(self.cv_folds, len(y) // 5 or 2), scoring="accuracy")
+        cv_folds = min(self.cv_folds, max(2, min(np.bincount(y))))
+        cv_scores = cross_val_score(model, X_scaled, y, cv=cv_folds, scoring="accuracy")
 
         # Feature importances
         importances = {}
@@ -159,8 +244,12 @@ class PredictiveAnalytics:
         elif hasattr(model, "coef_"):
             importances = dict(zip(feature_cols, np.abs(model.coef_[0]).round(4).tolist()))
 
+        # Sort importances descending
+        importances = dict(sorted(importances.items(), key=lambda x: x[1], reverse=True))
+
         # Predictions for all learners
         all_proba = model.predict_proba(scaler.transform(df[feature_cols].values))[:, 1]
+        df = df.copy()
         df[f"{task_name}_probability"] = all_proba.round(3)
 
         self._trained_models[task_name] = {
@@ -172,6 +261,7 @@ class PredictiveAnalytics:
         result = {
             "task": task_name,
             "model_type": model_type,
+            "features_used": feature_cols,
             "accuracy": round(accuracy_score(y_test, y_pred), 4),
             "precision": round(precision_score(y_test, y_pred, zero_division=0), 4),
             "recall": round(recall_score(y_test, y_pred, zero_division=0), 4),
@@ -183,7 +273,10 @@ class PredictiveAnalytics:
             "class_distribution": {"positive": int(y.sum()), "negative": int(len(y) - y.sum())},
         }
         if y_proba is not None:
-            result["auc_roc"] = round(roc_auc_score(y_test, y_proba), 4)
+            try:
+                result["auc_roc"] = round(roc_auc_score(y_test, y_proba), 4)
+            except ValueError:
+                result["auc_roc"] = None
 
         # Top at-risk learners
         risk_df = df[["email", f"{task_name}_probability"]].sort_values(
